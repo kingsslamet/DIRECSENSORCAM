@@ -4,14 +4,17 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
+import android.media.ImageReader
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
@@ -20,6 +23,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Rational
+import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import android.widget.Button
@@ -37,10 +41,12 @@ class MainActivity : AppCompatActivity() {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var previewBuilder: CaptureRequest.Builder? = null
+    private var imageReader: ImageReader? = null
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
 
+    private var isPortraitMode = true
     private var isFlipOn = true
     private var isEisOn = true
     private var isLscOn = true
@@ -56,9 +62,11 @@ class MainActivity : AppCompatActivity() {
     private var isRecording = false
     private var mediaRecorder: MediaRecorder? = null
     private var sensorOrientation = 90
+    private var photoSize = Size(4000, 3000)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         setContentView(R.layout.activity_main)
 
         cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -134,11 +142,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUi() {
+        val btnRotate = findViewById<Button>(R.id.btnRotate)
         val btnFlip = findViewById<Button>(R.id.btnFlip)
         val btnEis = findViewById<Button>(R.id.btnEis)
         val btnLsc = findViewById<Button>(R.id.btnLsc)
         val btnTone = findViewById<Button>(R.id.btnTone)
+        val btnPhoto = findViewById<Button>(R.id.btnPhoto)
         val btnRecord = findViewById<Button>(R.id.btnRecord)
+
+        btnRotate.setOnClickListener {
+            isPortraitMode = !isPortraitMode
+            if (isPortraitMode) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                btnRotate.text = "LAYAR: VERTIKAL"
+            } else {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                btnRotate.text = "LAYAR: HORIZONTAL"
+            }
+            textureView.postDelayed({
+                configureTransform(textureView.width, textureView.height)
+            }, 150)
+        }
 
         btnFlip.setOnClickListener {
             isFlipOn = !isFlipOn
@@ -208,6 +232,10 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(sb: SeekBar?) {}
         })
 
+        btnPhoto.setOnClickListener {
+            takePhoto()
+        }
+
         btnRecord.setOnClickListener {
             if (!isRecording) startRecording(btnRecord) else stopRecording(btnRecord)
         }
@@ -232,6 +260,24 @@ class MainActivity : AppCompatActivity() {
         val characteristics = cameraManager.getCameraCharacteristics(camId)
         sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG)
+        if (!jpegSizes.isNullOrEmpty()) {
+            photoSize = jpegSizes.maxByOrNull { it.width * it.height } ?: Size(4000, 3000)
+        }
+
+        imageReader?.close()
+        imageReader = ImageReader.newInstance(photoSize.width, photoSize.height, ImageFormat.JPEG, 2).apply {
+            setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                image.close()
+                saveJpegToGallery(bytes)
+            }, backgroundHandler)
+        }
+
         cameraManager.openCamera(camId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 cameraDevice = camera
@@ -248,6 +294,7 @@ class MainActivity : AppCompatActivity() {
     private fun startPreview() {
         val camera = cameraDevice ?: return
         val st = textureView.surfaceTexture ?: return
+        val readerSurface = imageReader?.surface ?: return
         st.setDefaultBufferSize(1920, 1080)
         val previewSurface = Surface(st)
 
@@ -256,13 +303,46 @@ class MainActivity : AppCompatActivity() {
         }
         applyIspSettings(previewBuilder!!)
 
-        camera.createCaptureSession(listOf(previewSurface), object : CameraCaptureSession.StateCallback() {
+        camera.createCaptureSession(listOf(previewSurface, readerSurface), object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 session.setRepeatingRequest(previewBuilder!!.build(), null, backgroundHandler)
             }
             override fun onConfigureFailed(session: CameraCaptureSession) {}
         }, backgroundHandler)
+    }
+
+    private fun takePhoto() {
+        val camera = cameraDevice ?: return
+        val session = captureSession ?: return
+        val readerSurface = imageReader?.surface ?: return
+
+        try {
+            val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(readerSurface)
+                set(CaptureRequest.JPEG_ORIENTATION, getMediaOrientationHint())
+                set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+            }
+            applyIspSettings(captureBuilder)
+            session.capture(captureBuilder.build(), null, backgroundHandler)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Gagal memotret: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveJpegToGallery(bytes: ByteArray) {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "DirectSensor_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/DirectSensor")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return
+        contentResolver.openOutputStream(uri)?.use { out ->
+            out.write(bytes)
+        }
+        runOnUiThread {
+            Toast.makeText(this, "Foto tersimpan di Pictures/DirectSensor", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun applyIspSettings(builder: CaptureRequest.Builder) {
@@ -345,7 +425,7 @@ class MainActivity : AppCompatActivity() {
         try { s.setRepeatingRequest(b.build(), null, backgroundHandler) } catch (_: Exception) {}
     }
 
-    private fun getVideoOrientationHint(): Int {
+    private fun getMediaOrientationHint(): Int {
         val displayDegrees = when (getDisplayRotation()) {
             Surface.ROTATION_0 -> 0
             Surface.ROTATION_90 -> 90
@@ -379,7 +459,7 @@ class MainActivity : AppCompatActivity() {
             setVideoSize(1920, 1080)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            setOrientationHint(getVideoOrientationHint())
+            setOrientationHint(getMediaOrientationHint())
             prepare()
         }
 
@@ -429,6 +509,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         cameraDevice?.close()
+        imageReader?.close()
         backgroundThread?.quitSafely()
         super.onPause()
     }
