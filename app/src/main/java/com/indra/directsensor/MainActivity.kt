@@ -5,12 +5,15 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Matrix
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
@@ -25,6 +28,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -51,6 +55,7 @@ class MainActivity : AppCompatActivity() {
 
     private var isRecording = false
     private var mediaRecorder: MediaRecorder? = null
+    private var sensorOrientation = 90
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,22 +68,68 @@ class MainActivity : AppCompatActivity() {
 
         textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                applyFlipTransform(w, h)
+                configureTransform(w, h)
                 checkPermissionsAndOpen()
             }
             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
-                applyFlipTransform(w, h)
+                configureTransform(w, h)
             }
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture) = true
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
     }
 
-    private fun applyFlipTransform(width: Int, height: Int) {
-        val matrix = Matrix()
-        if (isFlipOn) {
-            matrix.postScale(-1f, -1f, width / 2f, height / 2f)
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (textureView.isAvailable) {
+            configureTransform(textureView.width, textureView.height)
         }
+    }
+
+    private fun getDisplayRotation(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            display?.rotation ?: Surface.ROTATION_0
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.rotation
+        }
+    }
+
+    private fun configureTransform(viewWidth: Int, viewHeight: Int) {
+        if (viewWidth == 0 || viewHeight == 0) return
+        val rotation = getDisplayRotation()
+        val matrix = Matrix()
+        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
+        val bufferRect = RectF(0f, 0f, 1080f, 1920f)
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+
+        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = min(
+                viewWidth.toFloat() / 1920f,
+                viewHeight.toFloat() / 1080f
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
+            matrix.postRotate((90 * (rotation - 2)).toFloat(), centerX, centerY)
+        } else {
+            val scale = min(
+                viewWidth.toFloat() / 1080f,
+                viewHeight.toFloat() / 1920f
+            )
+            val sx = (scale * 1080f) / viewWidth.toFloat()
+            val sy = (scale * 1920f) / viewHeight.toFloat()
+            matrix.setScale(sx, sy, centerX, centerY)
+            if (rotation == Surface.ROTATION_180) {
+                matrix.postRotate(180f, centerX, centerY)
+            }
+        }
+
+        if (isFlipOn) {
+            matrix.postScale(-1f, -1f, centerX, centerY)
+        }
+
         textureView.setTransform(matrix)
     }
 
@@ -92,7 +143,7 @@ class MainActivity : AppCompatActivity() {
         btnFlip.setOnClickListener {
             isFlipOn = !isFlipOn
             btnFlip.text = if (isFlipOn) "FLIP: ON" else "FLIP: OFF"
-            applyFlipTransform(textureView.width, textureView.height)
+            configureTransform(textureView.width, textureView.height)
         }
 
         btnEis.setOnClickListener {
@@ -178,9 +229,13 @@ class MainActivity : AppCompatActivity() {
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
         } ?: "0"
 
+        val characteristics = cameraManager.getCameraCharacteristics(camId)
+        sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
         cameraManager.openCamera(camId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 cameraDevice = camera
+                runOnUiThread { configureTransform(textureView.width, textureView.height) }
                 startPreview()
             }
             override fun onDisconnected(camera: CameraDevice) { camera.close() }
@@ -211,30 +266,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyIspSettings(builder: CaptureRequest.Builder) {
-        // 1. Matikan Autofokus (wajib untuk lensa manual / direct sensor)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)
 
-        // 2. Stabilizer Hardware (EIS)
         builder.set(
             CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
             if (isEisOn) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
             else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
         )
 
-        // 3. Lens Shading Correction (Penghilang vignette & pinggiran ungu/hijau)
         builder.set(
             CaptureRequest.SHADING_MODE,
             if (isLscOn) CaptureRequest.SHADING_MODE_HIGH_QUALITY
             else CaptureRequest.SHADING_MODE_OFF
         )
 
-        // 4. Manual Exposure (ISO & Shutter Speed)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
         builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 1_000_000_000L / currentShutterDiv)
 
-        // 5. White Balance & Color Matrix Presets (Netral + Tune Warna via Hardware ISP)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
         builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
         builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, buildColorGains())
@@ -247,35 +297,33 @@ class MainActivity : AppCompatActivity() {
         var g = 1.0f
         var b = 2.35f - (kFactor * 1.25f)
 
-        // Penyesuaian gain sesuai preset warna & slider kekuatan
         when (toneIndex) {
-            1 -> { g += 0.22f * toneStrength; r -= 0.08f * toneStrength } // Nature Green
-            2 -> { r += 0.25f * toneStrength; b -= 0.20f * toneStrength } // Film Warm
-            3 -> { b += 0.20f * toneStrength; r += 0.15f * toneStrength } // Teal & Orange
+            1 -> { g += 0.22f * toneStrength; r -= 0.08f * toneStrength }
+            2 -> { r += 0.25f * toneStrength; b -= 0.20f * toneStrength }
+            3 -> { b += 0.20f * toneStrength; r += 0.15f * toneStrength }
         }
         return RggbChannelVector(r.coerceAtLeast(0.5f), g, g, b.coerceAtLeast(0.5f))
     }
 
     private fun buildColorMatrix(): ColorSpaceTransform {
-        // Matriks 3x3 dasar (Identitas Netral) dengan campuran saturasi/kontras ringan
         val s = toneStrength
         val elements = when (toneIndex) {
-            1 -> intArrayOf( // Nature Green (daun lebih segar, merah diredam)
+            1 -> intArrayOf(
                 90, 100, 10, 100, 0, 100,
                 -5, 100, 112, 100, -5, 100,
                 0, 100, 5, 100, 95, 100
             )
-            2 -> intArrayOf( // Film Warm
+            2 -> intArrayOf(
                 110, 100, -5, 100, -5, 100,
                 5, 100, 100, 100, -5, 100,
                 -8, 100, 0, 100, 92, 100
             )
-            3 -> intArrayOf( // Teal & Orange
+            3 -> intArrayOf(
                 115, 100, -10, 100, -5, 100,
                 -5, 100, 102, 100, 5, 100,
                 -10, 100, 10, 100, 110, 100
             )
-            else -> intArrayOf( // Netral (Natural flat untuk grading)
+            else -> intArrayOf(
                 95, 100, 5, 100, 0, 100,
                 0, 100, 100, 100, 0, 100,
                 0, 100, 5, 100, 95, 100
@@ -297,6 +345,21 @@ class MainActivity : AppCompatActivity() {
         try { s.setRepeatingRequest(b.build(), null, backgroundHandler) } catch (_: Exception) {}
     }
 
+    private fun getVideoOrientationHint(): Int {
+        val displayDegrees = when (getDisplayRotation()) {
+            Surface.ROTATION_0 -> 0
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        var orientation = (sensorOrientation - displayDegrees + 360) % 360
+        if (isFlipOn) {
+            orientation = (orientation + 180) % 360
+        }
+        return orientation
+    }
+
     private fun startRecording(btn: Button) {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, "DirectSensor_${System.currentTimeMillis()}.mp4")
@@ -316,6 +379,7 @@ class MainActivity : AppCompatActivity() {
             setVideoSize(1920, 1080)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
             setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            setOrientationHint(getVideoOrientationHint())
             prepare()
         }
 
@@ -357,7 +421,10 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         backgroundThread = HandlerThread("CamBg").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
-        if (textureView.isAvailable) checkPermissionsAndOpen()
+        if (textureView.isAvailable) {
+            configureTransform(textureView.width, textureView.height)
+            checkPermissionsAndOpen()
+        }
     }
 
     override fun onPause() {
