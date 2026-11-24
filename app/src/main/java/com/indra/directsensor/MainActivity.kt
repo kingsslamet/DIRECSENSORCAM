@@ -1,4 +1,4 @@
-﻿package com.indra.directsensor
+package com.indra.directsensor
 
 import android.Manifest
 import android.annotation.SuppressLint
