@@ -8,7 +8,7 @@
     <application
         android:icon="@drawable/ic_launcher_custom"
         android:allowBackup="true"
-        android:label="DirectSensorCam"
+        android:label="OpticCam Pro"
         android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
         <activity
             android:name=".MainActivity"
